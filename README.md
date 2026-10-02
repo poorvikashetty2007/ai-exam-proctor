@@ -1,6 +1,7 @@
 # AI Exam Proctor
 
 A laptop-only AI system that watches a student through the webcam during an online test and flags suspicious behaviour. Every violation is logged with a timestamp and a snapshot as evidence.
+   **Live demo:** [Try it in your browser](https://poorvikashetty2007.github.io/ai-exam-proctor/)
 
 ## Features
 - **No face detected:** student left the frame or covered the camera

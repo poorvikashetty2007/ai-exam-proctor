@@ -1,0 +1,134 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AI Exam Proctor - Live Demo</title>
+<style>
+  body{margin:0;font-family:system-ui,sans-serif;background:#111;color:#eee;text-align:center;padding:16px}
+  h1{margin:8px 0 4px}
+  p.note{color:#aaa;font-size:14px;max-width:640px;margin:4px auto 14px}
+  #wrap{position:relative;display:inline-block;width:640px;max-width:100%;transform:scaleX(-1);border:6px solid #2a2a2a;border-radius:8px}
+  video,canvas{display:block;width:100%}
+  canvas{position:absolute;left:0;top:0;height:100%}
+  #status{font-size:26px;font-weight:bold;margin:12px 0 4px}
+  button{font-size:16px;padding:10px 20px;margin:6px;border:0;border-radius:6px;background:#2d7ff9;color:#fff;cursor:pointer}
+  button:disabled{background:#555}
+  #log{list-style:none;padding:0;max-width:640px;margin:8px auto;text-align:left;max-height:180px;overflow:auto}
+  #log li{padding:4px 8px;border-bottom:1px solid #333}
+</style>
+</head>
+<body>
+<h1>AI Exam Proctor</h1>
+<p class="note">Browser demo. Everything runs on your device and your video is never uploaded.
+Click Start, allow the camera, then look straight at the screen for 2 seconds to calibrate.</p>
+<button id="go">Start</button><button id="recal">Recalibrate</button>
+<div id="status">Not started</div>
+<div id="wrap"><video id="v" playsinline muted></video><canvas id="c"></canvas></div>
+<p>Violations logged: <b id="count">0</b></p>
+<ul id="log"></ul>
+
+<script type="module">
+import { FilesetResolver, FaceLandmarker, ObjectDetector }
+  from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs";
+
+const $ = id => document.getElementById(id);
+const HOLD = 1500, COOL = 3000;            // ms: how long before alert / gap between alerts
+const HEAD_LIMIT = 0.08, GAZE_LIMIT = 0.25; // lower = stricter
+let face, obj, base = null, calib = [], dets = [], frame = 0;
+const started = {}, last = {}, counts = {};
+
+function check(ev, active, now) {
+  if (!active) { delete started[ev]; return; }
+  started[ev] ??= now;
+  if (now - started[ev] >= HOLD && now - (last[ev] || 0) >= COOL) {
+    last[ev] = now; counts[ev] = (counts[ev] || 0) + 1;
+    const li = document.createElement("li");
+    li.textContent = new Date().toLocaleTimeString() + " - " + ev.replaceAll("_", " ");
+    $("log").prepend(li);
+    $("count").textContent = Object.values(counts).reduce((a, b) => a + b, 0);
+  }
+}
+
+$("recal").onclick = () => { base = null; calib = []; };
+
+$("go").onclick = async () => {
+  $("go").disabled = true;
+  $("status").textContent = "Loading models...";
+  try {
+    const fs = await FilesetResolver.forVisionTasks("https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm");
+    face = await FaceLandmarker.createFromOptions(fs, {
+      baseOptions: { modelAssetPath: "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task" },
+      runningMode: "VIDEO", numFaces: 3, outputFaceBlendshapes: true });
+    obj = await ObjectDetector.createFromOptions(fs, {
+      baseOptions: { modelAssetPath: "https://storage.googleapis.com/mediapipe-models/object_detector/efficientdet_lite0/float16/1/efficientdet_lite0.tflite" },
+      runningMode: "VIDEO", scoreThreshold: 0.4 });
+    const v = $("v");
+    v.srcObject = await navigator.mediaDevices.getUserMedia({ video: { width: 640, height: 480 } });
+    await v.play();
+    requestAnimationFrame(loop);
+  } catch (e) {
+    $("status").textContent = "Could not start: " + e.message;
+    $("go").disabled = false;
+  }
+};
+
+function loop() {
+  const v = $("v"), c = $("c"), g = c.getContext("2d"), now = performance.now();
+  frame++;
+  c.width = v.videoWidth; c.height = v.videoHeight;
+
+  const r = face.detectForVideo(v, now);
+  const n = r.faceLandmarks.length;
+  let head = false, gaze = false;
+  if (n === 1) {
+    const L = r.faceLandmarks[0];
+    const bs = Object.fromEntries(r.faceBlendshapes[0].categories.map(k => [k.categoryName, k.score]));
+    const yaw = (L[1].x - L[234].x) / (L[454].x - L[234].x);
+    const pitch = (L[1].y - L[10].y) / (L[152].y - L[10].y);
+    const gh = ((bs.eyeLookOutLeft + bs.eyeLookInRight) - (bs.eyeLookInLeft + bs.eyeLookOutRight)) / 2;
+    const gv = ((bs.eyeLookUpLeft + bs.eyeLookUpRight) - (bs.eyeLookDownLeft + bs.eyeLookDownRight)) / 2;
+    const blink = (bs.eyeBlinkLeft + bs.eyeBlinkRight) / 2;
+    const cur = [yaw, pitch, gh, gv];
+    if (!base) {
+      if (blink < 0.5) calib.push(cur);
+      if (calib.length >= 40) base = cur.map((_, i) => calib.reduce((s, a) => s + a[i], 0) / calib.length);
+    } else {
+      const d = cur.map((x, i) => Math.abs(x - base[i]));
+      head = d[0] > HEAD_LIMIT || d[1] > HEAD_LIMIT;
+      gaze = blink < 0.5 && (d[2] > GAZE_LIMIT || d[3] > GAZE_LIMIT);
+    }
+  }
+
+  if (frame % 5 === 0) dets = obj.detectForVideo(v, now).detections;
+  const name = d => d.categories[0].categoryName;
+  const persons = dets.filter(d => name(d) === "person").length;
+  const phone = dets.some(d => name(d) === "cell phone");
+  const book = dets.some(d => name(d) === "book");
+  g.strokeStyle = "red"; g.lineWidth = 3;
+  dets.filter(d => ["person", "cell phone", "book"].includes(name(d)))
+      .forEach(d => g.strokeRect(d.boundingBox.originX, d.boundingBox.originY, d.boundingBox.width, d.boundingBox.height));
+
+  let status = "OK", color = "#2ecc71";
+  if (!base) { status = "Calibrating... look at the screen"; color = "#f1c40f"; }
+  else {
+    check("NO_FACE", n === 0, now);
+    check("MULTIPLE_PEOPLE", n > 1 || persons > 1, now);
+    check("PHONE_DETECTED", phone, now);
+    check("BOOK_DETECTED", book, now);
+    check("HEAD_TURNED", head, now);
+    check("GAZE_AWAY", gaze, now);
+    if (n === 0) [status, color] = ["No face detected", "#e74c3c"];
+    else if (n > 1 || persons > 1) [status, color] = ["Multiple people!", "#e74c3c"];
+    else if (phone) [status, color] = ["Phone detected!", "#e74c3c"];
+    else if (book) [status, color] = ["Book detected!", "#e74c3c"];
+    else if (head) [status, color] = ["Head turned away", "#e67e22"];
+    else if (gaze) [status, color] = ["Eyes looking away", "#e67e22"];
+  }
+  $("status").textContent = status; $("status").style.color = color;
+  $("wrap").style.borderColor = status === "OK" ? "#2a2a2a" : color;
+  requestAnimationFrame(loop);
+}
+</script>
+</body>
+</html>
